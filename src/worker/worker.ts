@@ -1,15 +1,18 @@
 import pg from 'pg';
 import type { Config } from '../config.js';
 import type { Logger } from '../log.js';
-import { JobState } from '../core/states.js';
+import { JobState, TERMINAL_STATES } from '../core/states.js';
 import {
   completeJob,
   failJob,
   findNotEnqueued,
   getJob,
+  getJobStates,
   leaseJob,
   markEnqueued,
+  markNotEnqueued,
   reapExpiredLeases,
+  renewLease,
   type Job,
 } from '../core/jobs.js';
 import type { QueueCoordinator } from '../queue/redis.js';
@@ -28,7 +31,6 @@ export class Worker {
   ) {}
 
   async run(): Promise<void> {
-    // lease reaper + un-enqueued sweeper run alongside the claim loop
     const reaper = this.every(this.config.workerReaperIntervalMs, () => this.reap());
     const sweeper = this.every(this.config.workerSweepIntervalMs, () => this.sweep());
 
@@ -76,8 +78,13 @@ export class Worker {
     try {
       leased = await leaseJob(this.pool, jobId, this.config.workerId, this.config.workerLeaseMs);
     } catch (err) {
-      log.warn({ err }, 'lease failed (postgres); job stays claimable');
-      await this.queue.releaseInflight(jobId).catch(() => {});
+      log.warn({ err }, 'lease failed (postgres); returning job to ready');
+      try {
+        await this.queue.requeueToReady(jobId);
+      } catch (rqErr) {
+        log.warn({ err: rqErr }, 'redis requeue failed; marking not-enqueued for sweeper');
+        await markNotEnqueued(this.pool, jobId).catch(() => {});
+      }
       return;
     }
     if (!leased) {
@@ -94,6 +101,16 @@ export class Worker {
 
     const handler = this.handlerMap[job.type];
     const startedAt = new Date();
+
+    // Lease heartbeat: renew at ~1/3 of the lease so long handlers aren't reaped.
+    const heartbeat = setInterval(() => {
+      renewLease(this.pool, job.id, this.config.workerId, job.attempt, this.config.workerLeaseMs)
+        .then((ok) => {
+          if (!ok) log.warn('heartbeat lost lease');
+        })
+        .catch((err) => log.warn({ err }, 'heartbeat renew failed'));
+    }, Math.max(1000, Math.floor(this.config.workerLeaseMs / 3)));
+
     try {
       if (!handler) throw new Error(`no handler registered for type '${job.type}'`);
       const result = await handler(job.payload, { jobId: job.id, attempt: job.attempt });
@@ -119,6 +136,7 @@ export class Worker {
       }
       log.warn({ attempt: job.attempt, next: outcome?.next ?? 'lost-lease', err: message }, 'job failed');
     } finally {
+      clearInterval(heartbeat);
       await this.queue.releaseInflight(jobId).catch(() => {});
     }
   }
@@ -128,10 +146,14 @@ export class Worker {
     try {
       const reaped = await reapExpiredLeases(this.pool);
       for (const job of reaped) {
+        if (job.outcome === 'dead') {
+          this.log.warn({ jobId: job.id }, 'job dead-lettered at max_attempts after lease expiry');
+          continue;
+        }
         try {
           await this.queue.enqueue(job.id, job.run_at);
           await markEnqueued(this.pool, job.id);
-          this.log.warn({ jobId: job.id, attempt: job.attempt }, 'reaped expired lease');
+          this.log.warn({ jobId: job.id }, 'reaped expired lease');
         } catch (err) {
           this.log.warn({ err, jobId: job.id }, 'requeue after reap failed; sweeper will retry');
         }
@@ -142,9 +164,12 @@ export class Worker {
   }
 
   /**
-   * Re-push jobs that were persisted but never reached Redis, and reconcile
-   * orphaned inflight entries (worker died between RPOPLPUSH and the
-   * Postgres lease — the row is still queued but nobody will run it).
+   * Re-push jobs persisted but never pushed to Redis, and reconcile
+   * orphaned inflight entries. An inflight id is only treated as orphaned
+   * once its claim is older than `claimGraceMs` — this closes the race where
+   * the sweeper steals a job a worker just claimed but hasn't leased yet.
+   * Terminal (succeeded/dead) or missing rows are always released so the
+   * inflight list can't leak.
    */
   private async sweep(): Promise<void> {
     try {
@@ -159,22 +184,31 @@ export class Worker {
       }
 
       const inflightIds = await this.queue.inflightIds();
-      if (inflightIds.length > 0) {
-        const { rows } = await this.pool.query<{ id: string; state: JobState; run_at: Date }>(
-          'SELECT id, state, run_at FROM jobs WHERE id = ANY($1)',
-          [inflightIds],
-        );
-        const byId = new Map(rows.map((r) => [r.id, r]));
-        for (const id of inflightIds) {
-          const row = byId.get(id);
-          if (!row || row.state === JobState.Queued || row.state === JobState.Delayed) {
-            // orphaned: never leased (or recovered) — return to a real queue
-            await this.queue.releaseInflight(id);
-            if (row) await this.queue.enqueue(id, row.run_at);
-            this.log.warn({ jobId: id }, 'repaired orphaned inflight entry');
-          }
-          // leased jobs genuinely in-flight are left alone
+      if (inflightIds.length === 0) return;
+
+      const [byId, claimTimes] = await Promise.all([
+        getJobStates(this.pool, inflightIds),
+        this.queue.claimTimes(inflightIds),
+      ]);
+      const now = Date.now();
+      for (const id of inflightIds) {
+        const row = byId.get(id);
+        if (!row || TERMINAL_STATES.has(row.state)) {
+          // missing or finished — clean up inflight + claim stamp
+          await this.queue.releaseInflight(id);
+          this.log.warn({ jobId: id }, 'released stale inflight entry');
+          continue;
         }
+        if (row.state === JobState.Queued || row.state === JobState.Delayed) {
+          const claimedAt = claimTimes.get(id);
+          if (claimedAt !== undefined && now - claimedAt < this.config.claimGraceMs) {
+            continue; // actively being leased — leave it alone
+          }
+          await this.queue.releaseInflight(id);
+          await this.queue.enqueue(id, row.run_at);
+          this.log.warn({ jobId: id }, 'repaired orphaned inflight entry');
+        }
+        // leased jobs genuinely in-flight are left alone
       }
     } catch (err) {
       this.log.warn({ err }, 'sweeper tick failed');

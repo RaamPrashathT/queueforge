@@ -33,6 +33,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     workerSweepIntervalMs: 200,
     retryBaseDelayMs: 100,
     shutdownGraceMs: 3_000,
+    claimGraceMs: 500,
     ...overrides,
   };
 }

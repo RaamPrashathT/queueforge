@@ -6,6 +6,7 @@ import {
   resetState,
   startWorker,
   stopWorkers,
+  testConfig,
   waitFor,
   type TestEnv,
 } from './setup.js';
@@ -169,7 +170,7 @@ describe('workers', () => {
     }
   });
 
-  it('releases a lease-expired job back to queued via the reaper', async () => {
+  it('dead-letters a lease-expired job already at max_attempts', async () => {
     const res = await postJob({ type: 'sleep', payload: { ms: 5000 }, maxAttempts: 1 });
     const { job } = await res.json();
     const claimed = await env.queue.claimNext();
@@ -177,14 +178,14 @@ describe('workers', () => {
     await leaseJob(env.pool, job.id, 'crashed-worker', 300);
     const worker = startWorker(env, { workerId: 'reaper-worker' });
     try {
-      // maxAttempts=1 but the lease_expired recovery requeues it regardless of
-      // attempts — the reaper restores queued state; the next execution then
-      // dead-letters if it also fails. Here the echo... wait, type is sleep(5s).
-      // The reaper should at minimum put it back to queued.
-      await waitFor(async () => {
-        const s = await jobState(env, job.id);
-        return s?.state === 'queued' || s?.state === 'leased' || s?.state === 'succeeded';
-      });
+      // attempt was already 1 = max_attempts when the lease expired, so the
+      // reaper must dead-letter it, not requeue it (poison-pill fix).
+      await waitFor(async () => (await jobState(env, job.id))?.state === 'dead');
+      const { rows } = await env.pool.query(
+        "SELECT outcome FROM job_attempts WHERE job_id = $1 AND outcome = 'lease_expired'",
+        [job.id],
+      );
+      expect(rows).toHaveLength(1);
     } finally {
       await stopWorkers([worker]);
     }
@@ -214,5 +215,106 @@ describe('resilience', () => {
     const r = await env.app.request('/readyz');
     expect(r.status).toBe(200);
     expect((await r.json()).postgres).toBe(true);
+  });
+});
+
+describe('adversarial regressions', () => {
+  it('processes ready jobs FIFO, not LIFO', async () => {
+    for (let i = 0; i < 3; i++) {
+      await env.queue.enqueue(`job-fifo-${i}`, new Date());
+    }
+    const order = [
+      await env.queue.claimNext(),
+      await env.queue.claimNext(),
+      await env.queue.claimNext(),
+    ];
+    expect(order).toEqual(['job-fifo-0', 'job-fifo-1', 'job-fifo-2']);
+  });
+
+  it('returns a job to ready when leaseJob fails (no silent loss)', async () => {
+    const res = await postJob({ type: 'echo', payload: {} });
+    const { job } = await res.json();
+    const claimed = await env.queue.claimNext();
+    expect(claimed).toBe(job.id);
+
+    // exercise the worker's failure path: requeue to ready, atomically
+    await env.queue.requeueToReady(claimed!);
+    const next = await env.queue.claimNext();
+    expect(next).toBe(job.id);
+  });
+
+  it('cleans terminal jobs out of inflight (no leak)', async () => {
+    const res = await postJob({ type: 'echo', payload: {} });
+    const { job } = await res.json();
+    const worker = startWorker(env);
+    try {
+      await waitFor(async () => (await jobState(env, job.id))?.state === 'succeeded');
+      // simulate the leak window: id back on inflight after completion
+      await env.redis.rpush('qf:inflight', job.id);
+      await waitFor(async () => (await env.queue.inflightIds()).length === 0);
+      expect(await env.queue.inflightIds()).toEqual([]);
+    } finally {
+      await stopWorkers([worker]);
+    }
+  });
+
+  it('rejects malformed job ids with 400, not 500', async () => {
+    const res = await env.app.request('/jobs/not-a-uuid');
+    expect(res.status).toBe(400);
+    const res2 = await env.app.request('/jobs/not-a-uuid/attempts');
+    expect(res2.status).toBe(400);
+  });
+
+  it('fences stale workers: an old attempt cannot finalize a newer one', async () => {
+    const res = await postJob({ type: 'echo', payload: {} });
+    const { job } = await res.json();
+    const cfg = testConfig();
+    // worker-1 leases attempt 1
+    await env.queue.claimNext();
+    expect(await leaseJob(env.pool, job.id, cfg.workerId, 300)).toBe(true);
+    const staleJob = (await jobState(env, job.id))!;
+    expect(staleJob.attempt).toBe(1);
+    // lease expires; recovery worker leases attempt 2 (slow handler so we
+    // can observe the leased state before it completes)
+    const slowEcho: JobHandler = async () => {
+      await new Promise((r) => setTimeout(r, 2000));
+      return { ok: true };
+    };
+    const recovery = startWorker(env, { workerId: 'recovery' }, { echo: slowEcho });
+    try {
+      await waitFor(async () => {
+        const s = await jobState(env, job.id);
+        return s?.state === 'leased' && s.attempt === 2;
+      });
+      // stale worker now "finishes" attempt 1 — must NOT finalize attempt 2
+      const { completeJob } = await import('../../src/core/jobs.js');
+      await completeJob(env.pool, staleJob, cfg.workerId, { stale: true }, new Date());
+      const after = await jobState(env, job.id);
+      expect(after.state).toBe('leased');
+      expect(after.attempt).toBe(2);
+    } finally {
+      await stopWorkers([recovery]);
+    }
+  });
+
+  it('does not repair inflight entries inside the claim grace window', async () => {
+    const res = await postJob({ type: 'echo', payload: {} });
+    const { job } = await res.json();
+    const claimed = await env.queue.claimNext();
+    expect(claimed).toBe(job.id);
+    // sweeper runs every 200ms; claim grace is 500ms — inflight id must
+    // survive sweeps until the grace period passes or it is leased.
+    const worker = startWorker(env, { workerId: 'grace-worker' });
+    try {
+      await waitFor(async () => (await jobState(env, job.id))?.state === 'succeeded');
+    } finally {
+      await stopWorkers([worker]);
+    }
+    // the job ran exactly once (no sweeper-induced duplicate)
+    const { rows } = await env.pool.query(
+      "SELECT count(*)::int AS c FROM job_attempts WHERE job_id = $1 AND outcome = 'completed'",
+      [job.id],
+    );
+    expect(rows[0].c).toBe(1);
   });
 });

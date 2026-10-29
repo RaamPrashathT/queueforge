@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import type { QueueCoordinator } from '../queue/redis.js';
@@ -56,7 +57,9 @@ export function createApp({ pool, queue, redis, log }: AppDeps) {
     return c.json({ ok, postgres: pgOk, redis: redisOk }, ok ? 200 : 503);
   });
 
-  app.post('/jobs', async (c) => {
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  app.post('/jobs', bodyLimit({ maxSize: 1024 * 1024 }), async (c) => {
     let body: unknown;
     try {
       body = await c.req.json();
@@ -104,12 +107,16 @@ export function createApp({ pool, queue, redis, log }: AppDeps) {
   });
 
   app.get('/jobs/:id', async (c) => {
-    const job = await getJob(pool, c.req.param('id'));
+    const id = c.req.param('id');
+    if (!UUID_RE.test(id)) return c.json({ error: 'invalid job id' }, 400);
+    const job = await getJob(pool, id);
     if (!job) return c.json({ error: 'not found' }, 404);
     return c.json({ job });
   });
 
   app.get('/jobs/:id/attempts', async (c) => {
+    const id = c.req.param('id');
+    if (!UUID_RE.test(id)) return c.json({ error: 'invalid job id' }, 400);
     const { rows } = await pool.query(
       'SELECT * FROM job_attempts WHERE job_id = $1 ORDER BY id',
       [c.req.param('id')],
