@@ -1,0 +1,35 @@
+{
+  "name": "queueforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Distributed background job processing: Hono API + workers, Postgres source of truth, Redis coordination",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start:api": "node dist/api/server.js",
+    "start:worker": "node dist/worker/server.js",
+    "dev:api": "tsx watch src/api/server.ts",
+    "dev:worker": "tsx watch src/worker/server.ts",
+    "migrate": "node dist/db/migrate.js",
+    "test": "vitest run",
+    "test:integration": "vitest run test/integration"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "hono": "^4.6.14",
+    "ioredis": "^5.4.2",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
