@@ -7,6 +7,8 @@ export async function runMigrations(pool: pg.Pool): Promise<string[]> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Serialize concurrent migration runs across API/worker replicas.
+    await client.query('SELECT pg_advisory_xact_lock(72747365)');
     await client.query(SCHEMA_MIGRATIONS_DDL);
     const { rows } = await client.query<{ id: string }>('SELECT id FROM schema_migrations');
     const applied = new Set(rows.map((r) => r.id));
